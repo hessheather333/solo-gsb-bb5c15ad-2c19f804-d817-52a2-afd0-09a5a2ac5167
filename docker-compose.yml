@@ -1,0 +1,10 @@
+services:
+  water-isolation:
+    build: .
+    container_name: water-isolation
+    ports:
+      - "4173:4173"
+    environment:
+      # 容器内监听端口；若修改，请同步调整上方 ports 映射
+      PORT: 4173
+    restart: unless-stopped
