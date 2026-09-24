@@ -301,3 +301,221 @@ export function solve(network: Network, query: Query): SolveResult {
       '请检查拓扑、供水点与保供出口设置，或考虑增设阀门 / 旁通管段。',
   };
 }
+
+/* ======================================================================
+ * 保供韧性巡检（最小割）
+ *
+ * 对每个保供出口，计算「使其失去全部供水至少需同时失效的不同管段数」：
+ *   - 无阀管段、当前开启的带阀管段各视为容量 1 的无向边（单条失效即断）；
+ *   - 已关闭的带阀管段当前本就不通，不参与；
+ *   - 增设超级源，以无限容量的有向边连接全部供水点，多供水点作为整体；
+ *   - 超级源 → 出口的最小割容量 = 最少失效管段数（边不相交路径定理），
+ *     跨过割的管段即为一组达到该数量的管段编号；
+ *   - 环路与并行管段各自占 1 单位容量，故分别计数。
+ * ==================================================================== */
+
+export type InspectionKind = 'ok' | 'dry' | 'is-supply';
+
+export interface InspectionItem {
+  outlet: string;
+  kind: InspectionKind;
+  /**
+   * 使其失去全部供水至少需同时失效的管段数：
+   * 已断水出口为 0；出口与供水点同名时为 null（无法按管段失效评估）。
+   */
+  minFailures: number | null;
+  /** 一组达到 minFailures 的管段编号（升序）；不可评估时为空清单 */
+  cutPipes: string[];
+  /** 巡检口径下该出口当前可达的供水点（已断水时为空） */
+  reachableSupplies: string[];
+}
+
+export interface InspectionOk {
+  status: 'ok';
+  /** 纳入计数的管段数（无阀管段 + 开启带阀管段） */
+  activePipeCount: number;
+  /** 不参与计数的已关阀管段数 */
+  closedValveCount: number;
+  /** 按所需失效数升序：已断水(0) 在前，同名供水点在后，并列保持输入顺序 */
+  items: InspectionItem[];
+}
+
+export interface InspectionInvalid {
+  status: 'invalid';
+  errors: string[];
+}
+
+export type InspectionResult = InspectionOk | InspectionInvalid;
+
+interface FlowEdge {
+  to: number;
+  cap: number;
+  rev: number;
+}
+
+/** 加一条容量为 1 的无向边：两个方向互为反向边、初始容量均为 1。 */
+function addUndirected(g: FlowEdge[][], u: number, v: number): void {
+  g[u].push({ to: v, cap: 1, rev: g[v].length });
+  g[v].push({ to: u, cap: 1, rev: g[u].length - 1 });
+}
+
+/** 加一条有向边（用于超级源 → 供水点）。 */
+function addDirected(g: FlowEdge[][], u: number, v: number, cap: number): void {
+  g[u].push({ to: v, cap, rev: g[v].length });
+  g[v].push({ to: u, cap: 0, rev: g[u].length - 1 });
+}
+
+/** Dinic 最大流（容量均为整数，图规模为管网级别）。 */
+function dinicMaxFlow(g: FlowEdge[][], s: number, t: number): number {
+  const n = g.length;
+  const level = new Array<number>(n).fill(-1);
+  const it = new Array<number>(n).fill(0);
+
+  const bfsLevel = (): boolean => {
+    level.fill(-1);
+    level[s] = 0;
+    const queue = [s];
+    let head = 0;
+    while (head < queue.length) {
+      const v = queue[head++];
+      for (const e of g[v]) {
+        if (e.cap > 0 && level[e.to] < 0) {
+          level[e.to] = level[v] + 1;
+          queue.push(e.to);
+        }
+      }
+    }
+    return level[t] >= 0;
+  };
+
+  const dfs = (v: number, pushed: number): number => {
+    if (v === t || pushed === 0) return pushed;
+    for (; it[v] < g[v].length; it[v]++) {
+      const e = g[v][it[v]];
+      if (e.cap <= 0 || level[e.to] !== level[v] + 1) continue;
+      const d = dfs(e.to, Math.min(pushed, e.cap));
+      if (d === 0) continue;
+      e.cap -= d;
+      g[e.to][e.rev].cap += d;
+      return d;
+    }
+    return 0;
+  };
+
+  let flow = 0;
+  while (bfsLevel()) {
+    it.fill(0);
+    while (true) {
+      const pushed = dfs(s, Number.MAX_SAFE_INTEGER);
+      if (pushed === 0) break;
+      flow += pushed;
+    }
+  }
+  return flow;
+}
+
+/** 最大流跑完后，残量网络中从源点仍可达的节点构成最小割的源侧。 */
+function residualReachable(g: FlowEdge[][], s: number): Set<number> {
+  const seen = new Set<number>([s]);
+  const queue = [s];
+  let head = 0;
+  while (head < queue.length) {
+    const v = queue[head++];
+    for (const e of g[v]) {
+      if (e.cap > 0 && !seen.has(e.to)) {
+        seen.add(e.to);
+        queue.push(e.to);
+      }
+    }
+  }
+  return seen;
+}
+
+/** 当前通水的管段：全部无阀管段 + 开启的带阀管段；已关阀不参与。 */
+function activePipes(network: Network): Pipe[] {
+  return [
+    ...network.pipes,
+    ...network.valvedPipes.filter((v) => v.open),
+  ];
+}
+
+/**
+ * 保供韧性巡检：按当前阀门开闭状态，对每个保供出口求使其断水的最小失效管段集合。
+ * 纯函数，不修改输入网络与阀门状态；巡检不使用漏点，也不受开启阀门数量上限约束。
+ */
+export function inspectResilience(
+  network: Network,
+  query: Pick<Query, 'supplies' | 'outlets'>
+): InspectionResult {
+  const errors: string[] = [];
+  const nodeSet = new Set(network.nodes);
+  const supplies = [...new Set(query.supplies)];
+  const outlets = [...new Set(query.outlets)];
+  if (supplies.length === 0) errors.push('至少需要指定一个供水点。');
+  for (const s of supplies) {
+    if (!nodeSet.has(s)) errors.push(`供水点「${s}」不在节点列表中。`);
+  }
+  if (outlets.length === 0) errors.push('至少需要指定一个保供出口。');
+  for (const o of outlets) {
+    if (!nodeSet.has(o)) errors.push(`保供出口「${o}」不在节点列表中。`);
+  }
+  if (errors.length > 0) return { status: 'invalid', errors };
+
+  const pipes = activePipes(network);
+  const nodeIndex = new Map<string, number>();
+  network.nodes.forEach((name, i) => nodeIndex.set(name, i));
+  const source = network.nodes.length;
+  const nNodes = network.nodes.length + 1;
+  // 无限容量取「管段总数 + 1」：真实割容量不超过管段总数，超级源边永不被割断
+  const INF = pipes.length + 1;
+  // 当前通水状态下的邻接表（已关阀已排除），用于判定当前可达供水点
+  const adj = buildAdjacency(network, new Set());
+
+  const minCutFor = (outlet: string): { value: number; cut: string[] } => {
+    const g: FlowEdge[][] = Array.from({ length: nNodes }, () => []);
+    for (const p of pipes) {
+      addUndirected(g, nodeIndex.get(p.from)!, nodeIndex.get(p.to)!);
+    }
+    for (const s of supplies) {
+      addDirected(g, source, nodeIndex.get(s)!, INF);
+    }
+    const t = nodeIndex.get(outlet)!;
+    const value = dinicMaxFlow(g, source, t);
+    const reach = residualReachable(g, source);
+    const cut = pipes
+      .filter((p) => reach.has(nodeIndex.get(p.from)!) !== reach.has(nodeIndex.get(p.to)!))
+      .map((p) => p.id)
+      .sort();
+    return { value, cut };
+  };
+
+  const items: InspectionItem[] = outlets.map((outlet) => {
+    // 出口本身就是供水点时，移除任何管段都无法使其「失去供水」，无法按管段失效评估
+    if (supplies.includes(outlet)) {
+      return { outlet, kind: 'is-supply', minFailures: null, cutPipes: [], reachableSupplies: [outlet] };
+    }
+    const reachableSupplies = supplies.filter((s) => bfs(adj, s).has(outlet));
+    if (reachableSupplies.length === 0) {
+      // 当前已经断水：无需再失效任何管段
+      return { outlet, kind: 'dry', minFailures: 0, cutPipes: [], reachableSupplies: [] };
+    }
+    const { value, cut } = minCutFor(outlet);
+    return { outlet, kind: 'ok', minFailures: value, cutPipes: cut, reachableSupplies };
+  });
+
+  // 稳定排序：已断水(0) → 正常出口按失效数升序（并列保持输入顺序）→ 同名供水点
+  items.sort((a, b) => inspectionRank(a) - inspectionRank(b));
+
+  return {
+    status: 'ok',
+    activePipeCount: pipes.length,
+    closedValveCount: network.valvedPipes.filter((v) => !v.open).length,
+    items,
+  };
+}
+
+function inspectionRank(it: InspectionItem): number {
+  if (it.kind === 'dry') return 0;
+  if (it.kind === 'is-supply') return Number.POSITIVE_INFINITY;
+  return it.minFailures ?? Number.POSITIVE_INFINITY;
+}

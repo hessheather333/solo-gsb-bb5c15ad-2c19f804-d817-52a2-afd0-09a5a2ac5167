@@ -113,5 +113,116 @@ const many = solver.parseNetwork({
 const r6 = solver.solve(many.network, { supplies: ['a'], leak: 'b', outlets: [] });
 check('超过 12 个开启阀门被拒绝', r6.status === 'invalid' && r6.errors.some((e) => e.includes('13')));
 
+console.log('保供韧性巡检：');
+// 复用主网络（V09 关闭）：出口均经单条枝管连到环状干管
+const i1 = solver.inspectResilience(network, { supplies: ['S1', 'S2'], outlets: ['B', 'C', 'D'] });
+check('巡检返回 ok', i1.status === 'ok');
+check('可用管段计数正确（2 无阀 + 8 开启阀门）', i1.activePipeCount === 10);
+check('已关阀管段计数为 1', i1.closedValveCount === 1);
+check('三个出口最少失效数均为 1（单条枝管）',
+  i1.items.every((it) => it.kind === 'ok' && it.minFailures === 1));
+const bItem = i1.items.find((it) => it.outlet === 'B');
+check('出口 B 的巡检清单为 [V08]（V09 已关不参与）', bItem.cutPipes.join(',') === 'V08');
+const cItem = i1.items.find((it) => it.outlet === 'C');
+check('出口 C 的巡检清单为 [P2]', cItem.cutPipes.join(',') === 'P2');
+check('清单长度等于最小失效数', i1.items.every((it) => it.cutPipes.length === it.minFailures));
+
+// 验证割集确实有效：删除清单管段后出口与全部供水点断开
+function disconnectedAfterCut(net, supplies, outlet, cutIds) {
+  const cut = new Set(cutIds);
+  const adj = new Map();
+  const addEdge = (a, b) => {
+    if (!adj.has(a)) adj.set(a, []);
+    adj.get(a).push(b);
+  };
+  for (const p of net.pipes) {
+    if (!cut.has(p.id)) { addEdge(p.from, p.to); addEdge(p.to, p.from); }
+  }
+  for (const vp of net.valvedPipes) {
+    if (vp.open && !cut.has(vp.id)) { addEdge(vp.from, vp.to); addEdge(vp.to, vp.from); }
+  }
+  const seen = new Set(supplies);
+  const q = [...supplies];
+  while (q.length) {
+    const v = q.shift();
+    for (const w of adj.get(v) ?? []) if (!seen.has(w)) { seen.add(w); q.push(w); }
+  }
+  return !seen.has(outlet);
+}
+check('割集验证：清单失效后出口确实断水',
+  i1.items.every((it) => disconnectedAfterCut(network, ['S1', 'S2'], it.outlet, it.cutPipes)));
+
+console.log('巡检：环路与并行管段分别计数：');
+// 环：S-a, a-b 两条并行，b-O，验证割数为 1；四条边组成的环 S-x-O, S-y-O 验证割数为 2
+const ringNet = {
+  nodes: ['S', 'X', 'Y', 'O'],
+  pipes: [
+    { id: 'P1', from: 'S', to: 'X' },
+    { id: 'P2', from: 'X', to: 'O' },
+    { id: 'P3', from: 'S', to: 'Y' },
+    { id: 'P4', from: 'Y', to: 'O' },
+  ],
+  valvedPipes: [],
+};
+const i2 = solver.inspectResilience(ringNet, { supplies: ['S'], outlets: ['O'] });
+check('环路两条独立路径 → 需失效 2 条', i2.items[0].minFailures === 2);
+check('割集为跨割的 2 条不同管段', i2.items[0].cutPipes.length === 2);
+check('割集失效后确实断水', disconnectedAfterCut(ringNet, ['S'], 'O', i2.items[0].cutPipes));
+
+const paraNet = {
+  nodes: ['S', 'A', 'B', 'O'],
+  pipes: [
+    { id: 'P1', from: 'S', to: 'A' },
+    { id: 'P2', from: 'A', to: 'B' },
+    { id: 'P3', from: 'A', to: 'B' },
+    { id: 'P4', from: 'B', to: 'O' },
+  ],
+  valvedPipes: [],
+};
+const i3 = solver.inspectResilience(paraNet, { supplies: ['S'], outlets: ['O'] });
+check('并行管段只计数为 1（瓶颈在 P1/P4）', i3.items[0].minFailures === 1);
+
+console.log('巡检：多供水点作为整体：');
+// S1、S2 各经一条管段在 X 汇合后到 O：割 X-O 一条即可，不能只断单个水源
+const multiNet = {
+  nodes: ['S1', 'S2', 'X', 'O'],
+  pipes: [
+    { id: 'P1', from: 'S1', to: 'X' },
+    { id: 'P2', from: 'S2', to: 'X' },
+    { id: 'P3', from: 'X', to: 'O' },
+  ],
+  valvedPipes: [],
+};
+const i4 = solver.inspectResilience(multiNet, { supplies: ['S1', 'S2'], outlets: ['O'] });
+check('多水源整体：切断公共段 P3 一条即可', i4.items[0].minFailures === 1 && i4.items[0].cutPipes.join(',') === 'P3');
+
+console.log('巡检：已断水出口、同名供水点与排序：');
+// A 当前已断水（唯一连通阀 V1 关闭）；S 与供水点同名
+const weirdNet = {
+  nodes: ['S', 'M', 'A'],
+  pipes: [],
+  valvedPipes: [
+    { id: 'V1', from: 'S', to: 'M', open: true },
+    { id: 'V2', from: 'M', to: 'A', open: false },
+  ],
+};
+const i5 = solver.inspectResilience(weirdNet, { supplies: ['S'], outlets: ['S', 'A'] });
+check('结果数为 2（去重）', i5.items.length === 2);
+check('已断水出口排最前且为 0 / 空清单',
+  i5.items[0].outlet === 'A' && i5.items[0].kind === 'dry' &&
+  i5.items[0].minFailures === 0 && i5.items[0].cutPipes.length === 0);
+check('同名供水点排最后且无法评估',
+  i5.items[1].outlet === 'S' && i5.items[1].kind === 'is-supply' &&
+  i5.items[1].minFailures === null && i5.items[1].cutPipes.length === 0);
+
+console.log('巡检：校验：');
+const i6 = solver.inspectResilience(network, { supplies: [], outlets: ['B'] });
+check('缺少供水点被拒绝', i6.status === 'invalid' && i6.errors.some((e) => e.includes('供水点')));
+const i7 = solver.inspectResilience(network, { supplies: ['S1'], outlets: ['ZZZ'] });
+check('出口不在节点中被拒绝', i7.status === 'invalid' && i7.errors.some((e) => e.includes('ZZZ')));
+const netBefore = JSON.stringify(network);
+solver.inspectResilience(network, { supplies: ['S1', 'S2'], outlets: ['B', 'C', 'D'] });
+check('巡检不修改输入', JSON.stringify(network) === netBefore);
+
 console.log(`\n${passed} 通过, ${failed} 失败`);
 process.exit(failed > 0 ? 1 : 0);

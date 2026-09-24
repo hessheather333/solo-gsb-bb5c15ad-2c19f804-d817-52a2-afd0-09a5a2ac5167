@@ -130,6 +130,16 @@ button.primary:hover {
   background: var(--primary-dark);
 }
 
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.action-hint {
+  margin: 10px 0 0;
+}
+
 .banner {
   border-radius: 8px;
   padding: 12px 14px;
@@ -204,4 +214,27 @@ td.ok {
 td.bad {
   color: var(--bad);
   font-weight: 600;
+}
+
+td.num {
+  font-size: 1.05rem;
+  font-weight: 700;
+  text-align: center;
+}
+
+.warn {
+  color: #92610a;
+  font-weight: 600;
+}
+
+.muted-text {
+  color: var(--muted);
+}
+
+td code {
+  background: rgba(11, 107, 203, 0.08);
+  border-radius: 4px;
+  padding: 1px 6px;
+  white-space: nowrap;
+  color: var(--primary-dark);
 }
